@@ -25,78 +25,87 @@ from folium.plugins import HeatMap
 from datetime import datetime
 from streamlit_folium import folium_static
 
-# USGS API URL
-url = "https://earthquake.usgs.gov/fdsnws/event/1/query"
+# Load datasets
+def load_data():
+    df_eq = pd.read_csv("earthquake_data_myanmar.csv")
+    df_eq["time"] = pd.to_datetime(df_eq["time"], errors="coerce")
+    df_eq["time"] = df_eq["time"].dt.tz_localize(None)
 
-st.title("Myanmar Earthquake Affected Population Estimation")
+    df_pop_mm = pd.read_csv("MyanmarPop_2014_Township.csv")
+    df_pop_mm = df_pop_mm.loc[:, ~df_pop_mm.columns.str.startswith('Unnamed')]
+    return df_eq, df_pop_mm
 
-# User Inputs
-min_magnitude = st.slider("Minimum Earthquake Magnitude", 4.0, 10.0, 4.0)
-start_year = st.number_input("Start Year", min_value=1900, max_value=2025, value=2024)
-end_year = st.number_input("End Year", min_value=1900, max_value=2025, value=2025)
 
-if st.button("Fetch Earthquake Data"):
-    batch_sizes = {(2024, 2025): 1}
-    all_data = []
+df_eq, df_pop_mm = load_data()
 
-    for (start, end), batch_size in batch_sizes.items():
-        for year in range(start, end + 1, batch_size):
-            params = {
-                "format": "csv",
-                "starttime": f"{year}-01-01",
-                "endtime": f"{min(year + batch_size - 1, end_year)}-12-31",
-                "minmagnitude": min_magnitude,
-                "maxmagnitude": 10.0,
-                "orderby": "time"
-            }
 
-            response = requests.get(url, params=params)
-            if response.status_code == 200:
-                df = pd.read_csv(io.StringIO(response.text))
-                all_data.append(df)
+def estimate_affected_population(eq_lat, eq_lon, eq_mag):
+    affected_pop = 0
+    for _, row in df_pop_mm.iterrows():
+        region_lat = row["Latitude"]
+        region_lon = row["Longitude"]
+        total_pop = row["Both sexes"]
 
-    if all_data:
-        df_eq = pd.concat(all_data, ignore_index=True)
-        st.session_state.df_eq = df_eq
-        st.success(f"Fetched {len(df_eq)} earthquake records")
-    else:
-        st.error("No data retrieved.")
+        if pd.isna(region_lat) or pd.isna(region_lon) or pd.isna(total_pop):
+            continue
 
-if "df_eq" in st.session_state:
-    df_eq = st.session_state.df_eq
+        distance_km = geodesic((eq_lat, eq_lon), (region_lat, region_lon)).km
+        max_radius = eq_mag * 10
 
-    myanmar_bounds = (16.0, 28.0, 92.0, 101.0)
-    df_myanmar = df_eq[(df_eq["latitude"] >= myanmar_bounds[0]) & (df_eq["latitude"] <= myanmar_bounds[1]) &
-                        (df_eq["longitude"] >= myanmar_bounds[2]) & (df_eq["longitude"] <= myanmar_bounds[3])]
+        if distance_km <= max_radius:
+            weight = np.exp(-distance_km / (max_radius / 2))
+            magnitude_factor = (eq_mag / 7.0) ** 2
+            affected_pop += total_pop * weight * magnitude_factor
 
-    st.write(f"Filtered {len(df_myanmar)} earthquakes in Myanmar")
+    return int(affected_pop)
 
-    def estimate_affected_population(eq_lat, eq_lon, eq_mag, df_pop_mm):
-        affected_pop = 0
-        for _, row in df_pop_mm.iterrows():
-            region_lat, region_lon, total_pop = row["lat"], row["lon"], row["hh_total"]
-            distance_km = geodesic((eq_lat, eq_lon), (region_lat, region_lon)).km
-            max_radius = eq_mag * 15
-            if distance_km <= max_radius:
-                weight = np.exp(-distance_km / (max_radius / 2))
-                magnitude_factor = (eq_mag / 7.0) ** 2
-                affected_pop += total_pop * weight * magnitude_factor
-        return int(affected_pop)
 
-    def plot_earthquake_map():
-        myanmar_map = folium.Map(location=[21.0, 96.0], zoom_start=5)
-        for _, row in df_myanmar.iterrows():
-            folium.CircleMarker(
-                location=[row["latitude"], row["longitude"]],
-                radius=max(5, np.log1p(row["mag"]) * 2),
-                color="red",
-                fill=True,
-                fill_color="red",
-                fill_opacity=0.7,
-                popup=f"Magnitude: {row['mag']}"
-            ).add_to(myanmar_map)
-        folium_static(myanmar_map)
+def plot_earthquake_map(start_date, end_date):
+    filtered_eq = df_eq[(df_eq["time"] >= start_date) & (df_eq["time"] <= end_date)].copy()
+    if filtered_eq.empty:
+        st.warning("No earthquakes found in the selected time range.")
+        return None
 
-    if st.button("Show Earthquake Map"):
-        plot_earthquake_map()
+    filtered_eq["Estimated_Affected_Pop"] = filtered_eq.apply(
+        lambda row: estimate_affected_population(row["latitude"], row["longitude"], row["mag"]), axis=1
+    )
+
+    st.write("### Debug: Filtered Earthquake Data")
+    st.write(filtered_eq.head())
+
+    myanmar_map = folium.Map(location=[21.0, 96.0], zoom_start=6)
+    heat_data = [[row["Latitude"], row["Longitude"], row["Both sexes"]] for _, row in df_pop_mm.iterrows()]
+    if heat_data:
+        HeatMap(heat_data, min_opacity=0.4, radius=20, blur=10, max_zoom=1).add_to(myanmar_map)
+
+    for _, row in filtered_eq.iterrows():
+        weighted_population = row["Estimated_Affected_Pop"]
+        popup_html = f"""
+        <b>Date:</b> {row['time'].strftime('%Y-%m-%d')}<br>
+        <b>Magnitude:</b> {row['mag']}<br>
+        <b>Estimated Affected Population:</b> {int(weighted_population):,}
+        """
+        folium.CircleMarker(
+            location=[row["latitude"], row["longitude"]],
+            radius=max(5, np.log1p(weighted_population) / 2),
+            color="red",
+            fill=True,
+            fill_color="red",
+            fill_opacity=min(0.9, weighted_population / 1e6) if weighted_population > 0 else 0.3,
+            popup=folium.Popup(popup_html, max_width=300),
+        ).add_to(myanmar_map)
+
+    folium_static(myanmar_map)
+
+
+# Streamlit UI
+st.title("Myanmar Earthquake Impact Analysis")
+st.sidebar.header("Filter Earthquake Data")
+start_date = st.sidebar.date_input("Start Date", datetime(2025, 1, 1))
+end_date = st.sidebar.date_input("End Date", datetime.today())
+
+if start_date > end_date:
+    st.error("Start date cannot be after end date!")
+else:
+    plot_earthquake_map(pd.to_datetime(start_date), pd.to_datetime(end_date))
 
