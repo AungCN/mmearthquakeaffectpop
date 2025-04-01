@@ -9,7 +9,7 @@ from streamlit_folium import folium_static
 
 # Load datasets
 def load_data():
-    df_eq = pd.read_csv("earthquake_affected_population_weighted_all_years.csv")
+    df_eq = pd.read_csv("earthquake_affected_population_weighted_allYears.csv")
     df_eq["time"] = pd.to_datetime(df_eq["time"], errors="coerce")
     df_eq["time"] = df_eq["time"].dt.tz_localize(None)
     
